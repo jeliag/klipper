@@ -163,6 +163,11 @@ class PrinterDisplayTemplate:
                 slot = dg.getint('hd44780_slot', minval=0, maxval=7)
                 idata = self._parse_glyph(config, glyph_name, data, 5, 8)
                 icons.setdefault(glyph_name, {})['icon5x8'] = (slot, idata)
+            data = dg.get('st7920_data', None)
+            if data is not None:
+                idata = self._parse_glyph(config, glyph_name, data, 6, 8)
+                icon = [(bits << 2) & 0xff for bits in idata]
+                icons.setdefault(glyph_name, {})['icon6x8'] = icon
 
 def lookup_display_templates(config):
     printer = config.get_printer()
@@ -252,11 +257,11 @@ class PrinterLCD:
                 # write glyph
                 pos += self.lcd_chip.write_glyph(pos, row, text)
         return pos
-    def draw_progress_bar(self, row, col, width, value):
+    def draw_progress_bar(self, row, col, height, width, value):
         pixels = -1 << int(width * 8 * (1. - value) + .5)
         pixels |= (1 << (width * 8 - 1)) | 1
         for i in range(width):
-            data = [0xff] + [(pixels >> (i * 8)) & 0xff] * 14 + [0xff]
+            data = [0xff] + [(pixels >> (i * 8)) & 0xff] * (height-2) + [0xff]
             self.lcd_chip.write_graphics(col + width - 1 - i, row, data)
         return ""
     cmd_SET_DISPLAY_GROUP_help = "Set the active display group"

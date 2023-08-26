@@ -6,8 +6,11 @@
 import logging
 from .. import bus
 from . import font8x14
+from . import font5x7
 
 BACKGROUND_PRIORITY_CLOCK = 0x7fffffff00000000
+LINE_COUNT_OPTIONS={4:(4, 16), 5:(5, 12), 6:(6, 10), 8:(8, 8)}
+LINE_COUNT_DEFAULT=4
 
 # Spec says 72us, but faster is possible in practice
 ST7920_CMD_DELAY  = .000020
@@ -15,6 +18,7 @@ ST7920_SYNC_DELAY = .000045
 
 TextGlyphs = { 'right_arrow': b'\x1a' }
 CharGlyphs = { 'degrees': bytearray(font8x14.VGA_FONT[0xf8]) }
+SmallGlyphs = { 'right_arrow': bytearray(font5x7.VGA_FONT[0x1a]), 'degrees': bytearray(font5x7.VGA_FONT[0xf8]) }
 
 class DisplayBase:
     def __init__(self):
@@ -85,61 +89,105 @@ class DisplayBase:
         self.cached_glyphs[glyph_name] = (base_glyph_name, (0, glyph_id*2))
     def set_glyphs(self, glyphs):
         for glyph_name, glyph_data in glyphs.items():
-            icon = glyph_data.get('icon16x16')
+            icon = glyph_data.get('icon6x8' if self.small_font else 'icon16x16')
             if icon is not None:
                 self.icons[glyph_name] = icon
         # Setup animated glyphs
-        self.cache_glyph('fan2', 'fan1', 0)
-        self.cache_glyph('bed_heat2', 'bed_heat1', 1)
+        if not self.small_font:
+            self.cache_glyph('fan2', 'fan1', 0)
+            self.cache_glyph('bed_heat2', 'bed_heat1', 1)
     def write_text(self, x, y, data):
-        if x + len(data) > 16:
-            data = data[:16 - min(x, 16)]
-        pos = [0, 32, 16, 48][y] + x
-        self.text_framebuffer[pos:pos+len(data)] = data
+        if x + len(data) > self.line_length:
+            data = data[:self.line_length - min(x, self.line_length)]
+        if self.small_font:
+            for i, char in enumerate(data):
+                self.write_graphics(x+i,y,font5x7.VGA_FONT[char])
+        else:
+            pos = [0, 32, 16, 48][y] + x
+            self.text_framebuffer[pos:pos+len(data)] = data
+    def to_pixel(self, x, y):
+        return (x * self.cell_width, y * self.line_height + self.top_margin)
     def write_graphics(self, x, y, data):
-        if x >= 16 or y >= 4 or len(data) != 16:
+        if x >= self.line_length or y >= self.line_count:
             return
-        gfx_fb = y * 16
-        if gfx_fb >= 32:
-            gfx_fb -= 32
-            x += 16
-        for i, bits in enumerate(data):
-            self.graphics_framebuffers[gfx_fb + i][x] = bits
+        xp, yp = self.to_pixel(x,y)
+        if self.small_font:
+            self.write_graphics_exact(xp, yp, data, mask=0b11111100)
+        else:
+            self.write_graphics_exact(xp, yp, data, mask=0b11111111)
+    def write_graphics_exact(self, xp, yp, data, mask=0xFF, pre_lshift=0):
+         gfx_fb = yp
+         gfx_fb_x = xp // 8
+         xp_offset = xp % 8
+         for i, bits in enumerate(data):
+            bits <<= pre_lshift
+            if gfx_fb + i >= 32:
+                gfx_fb -= 32
+                gfx_fb_x += 16
+            self.graphics_framebuffers[gfx_fb + i][gfx_fb_x] &= ~(mask >> xp_offset) & 0xFF
+            self.graphics_framebuffers[gfx_fb + i][gfx_fb_x] |= (bits >> xp_offset) & 0xFF
+            if  mask << 8 >> xp_offset & 0xFF != 0: # mask spills over into next byte
+                self.graphics_framebuffers[gfx_fb + i][gfx_fb_x+1] &= ~(mask << (8 - xp_offset)) & 0xFF
+                self.graphics_framebuffers[gfx_fb + i][gfx_fb_x+1] |= (bits << (8 - xp_offset)) & 0xFF
     def write_glyph(self, x, y, glyph_name):
-        glyph_id = self.cached_glyphs.get(glyph_name)
-        if glyph_id is not None and x & 1 == 0:
-            # Render cached icon using character generator
-            glyph_name = glyph_id[0]
-            self.write_text(x, y, glyph_id[1])
-        icon = self.icons.get(glyph_name)
-        if icon is not None:
-            # Draw icon in graphics mode
-            self.write_graphics(x, y, icon[0])
-            self.write_graphics(x + 1, y, icon[1])
-            return 2
-        char = TextGlyphs.get(glyph_name)
-        if char is not None:
-            # Draw character
-            self.write_text(x, y, char)
-            return 1
-        font = CharGlyphs.get(glyph_name)
-        if font is not None:
-            # Draw single width character
-            self.write_graphics(x, y, font)
-            return 1
-        return 0
+        if self.small_font:
+            icon = self.icons.get(glyph_name)
+            if icon is not None:
+                self.write_graphics(x, y, icon)
+                return 1
+            icon = SmallGlyphs.get(glyph_name)
+            if icon is not None:
+                self.write_graphics(x, y, icon)
+                return 1
+            return 0
+        else:
+            glyph_id = self.cached_glyphs.get(glyph_name)
+            if glyph_id is not None and x & 1 == 0:
+                # Render cached icon using character generator
+                glyph_name = glyph_id[0]
+                self.write_text(x, y, glyph_id[1])
+            icon = self.icons.get(glyph_name)
+            if icon is not None:
+                # Draw icon in graphics mode
+                self.write_graphics(x, y, icon[0])
+                self.write_graphics(x+1, y, icon[1])
+                return 2
+            char = TextGlyphs.get(glyph_name)
+            if char is not None:
+                # Draw character
+                self.write_text(x, y, char)
+                return 1
+            font = CharGlyphs.get(glyph_name)
+            if font is not None:
+                # Draw single width character
+                self.write_graphics(x, y, font)
+                return 1
+            return 0
     def clear(self):
         self.text_framebuffer[:] = b' '*64
         zeros = bytearray(32)
         for gfb in self.graphics_framebuffers:
             gfb[:] = zeros
+
+        # TODO: temp for tests
+        """if self.small_font:
+            for y in range(self.line_count + 1):
+                y = self.top_margin + y * self.line_height - 1 - (self.line_height - 8) // 2
+                for x in range(16):
+                    x *= 8
+                    self.write_graphics_exact(x, y, [0xFF])"""
     def get_dimensions(self):
-        return (16, 4)
+        return (self.line_length, self.line_count)
 
 # Display driver for stock ST7920 displays
 class ST7920(DisplayBase):
     def __init__(self, config):
         printer = config.get_printer()
+        self.line_count, self.line_height = config.getchoice('line_count', LINE_COUNT_OPTIONS, LINE_COUNT_DEFAULT)
+        self.top_margin = 64 - self.line_height * self.line_count
+        self.small_font = self.line_count > 4
+        self.cell_width = 6 if self.small_font else 8
+        self.line_length = 21 if self.small_font else 16
         # pin config
         ppins = printer.lookup_object('pins')
         pins = [ppins.lookup_pin(config.get(name + '_pin'))
